@@ -2,13 +2,25 @@ import os
 import json
 import discord
 from discord.ext import commands
-from openai import OpenAI 
 from dotenv import load_dotenv
 import asyncio
 from datetime import datetime, timedelta
+import io
+import aiohttp
+import asyncio
+from collections import deque
+import sys
+sys.dont_write_bytecode = True
 
 # Хранилище времени последней активности в канале (ключ: channel.id)
 last_activity = {}
+
+# Хранилище очередей TTS для каждого голосового канала (ключ: guild.id)
+tts_queues = {}
+# Хранилище задач обработки очередей (ключ: guild.id)
+tts_tasks = {}
+# Флаг остановки для каждой очереди
+tts_stop_flags = {}
 
 # Таймаут в секундах (по умолчанию 5 минут = 300 секунд)
 TIMEOUT_SECONDS = int(os.getenv('AUTO_MESSAGE_TIMEOUT', 120))
@@ -21,6 +33,33 @@ prompt_file = os.getenv('SYSTEM_PROMPT_FILE')
 if prompt_file and os.path.exists(prompt_file):
     with open(prompt_file, 'r', encoding='utf-8') as f:
         SYSTEM_PROMPT = f.read()
+
+async def call_claude_api(messages: list) -> str | None:
+    """Отправляет запрос к Claude через AITUNNEL и возвращает ответ"""
+    url = "https://api.aitunnel.ru/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {AITUNNEL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "anthropic/claude-sonnet-4.6",
+        "messages": messages,
+        "max_tokens": 4096,
+        "temperature": 1.1
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return data["choices"][0]["message"]["content"]
+                else:
+                    text = await resp.text()
+                    print(f"Ошибка Claude API: {resp.status} - {text}")
+                    return None
+    except Exception as e:
+        print(f"Исключение при вызове Claude: {e}")
+        return None
 
 def update_history(channel_id, user_message, author_name, bot_response):
     """
@@ -104,10 +143,10 @@ bot.setup_hook = setup_hook
 
 # --- НАСТРОЙКА КЛИЕНТА ДЛЯ AITUNNEL / CLAUDE ---
 # Используем OpenAI-совместимый интерфейс
-client = OpenAI(
-    api_key=AITUNNEL_API_KEY,
-    base_url="https://api.aitunnel.ru/v1/",   # прокси AITUNNEL
-)
+# client = OpenAI(
+#     api_key=AITUNNEL_API_KEY,
+#     base_url="https://api.aitunnel.ru/v1/",
+# )
 
 
 def load_config():
@@ -129,17 +168,33 @@ async def join_voice(ctx):
         channel = ctx.author.voice.channel
         await channel.connect()
         await ctx.send(f"Подключился к {channel.name}")
+
+        # Запускаем обработчик очереди TTS для этой гильдии
+        guild_id = ctx.guild.id
+        if guild_id not in tts_tasks and guild_id not in tts_stop_flags:
+            tts_stop_flags[guild_id] = False
+            tts_queues[guild_id] = asyncio.Queue()
+            task = asyncio.create_task(process_tts_queue(guild_id))
+            tts_tasks[guild_id] = task
     else:
-        await ctx.send("Вы не находитесь в голосовом канале!")
+        await ctx.send("А ниче тот факт что ты не в канале?")
 
 @bot.command(name="leave")
 async def leave_voice(ctx):
     """Отключение бота от голосового канала"""
     if ctx.voice_client:
+        # Останавливаем обработку очереди для этой гильдии
+        guild_id = ctx.guild.id
+        if guild_id in tts_stop_flags:
+            tts_stop_flags[guild_id] = True  # сигнал остановки
+        if guild_id in tts_queues:
+            # добавляем сигнал None, чтобы разблокировать queue.get()
+            await tts_queues[guild_id].put(None)
+
         await ctx.voice_client.disconnect()
-        await ctx.send("Отключился от голосового канала")
+        await ctx.send("До связи")
     else:
-        await ctx.send("Бот не находится в голосовом канале!")
+        await ctx.send("Я и так нигде не сижу")
 
 @bot.command(name="supporters")
 async def show_supporters(ctx):
@@ -147,64 +202,54 @@ async def show_supporters(ctx):
     supporters_text = "Supporters: \nSxcred \nLamenz \nGuPi_3"
     await ctx.send(supporters_text)
 
+async def enqueue_tts(guild_id: int, text: str):
+    """Добавляет текст в очередь TTS для указанной гильдии"""
+    if guild_id not in tts_queues:
+        tts_queues[guild_id] = asyncio.Queue()
+    await tts_queues[guild_id].put(text)
+
 @bot.event
 async def on_message(message):
-    # Игнорируем сообщения от самого бота
     if message.author == bot.user:
         return
 
-# Обновляем время последней активности для этого канала
     last_activity[message.channel.id] = datetime.now()
-
     await bot.process_commands(message)
 
     if message.content.startswith(BOT_PREFIX):
         return
 
     channel_id = message.channel.id
-    author_name = message.author.display_name  # ник в Discord (можно использовать name)
-
-    # Строим историю с текущим сообщением
+    author_name = message.author.display_name
     conversation = build_conversation_messages(channel_id, message.content, author_name)
 
-    try:
-        response = client.chat.completions.create(
-            model="anthropic/claude-sonnet-4.6",
-            messages=conversation,
-            max_tokens=4096,
-            temperature=1.1,
-        )
+    ai_response = await call_claude_api(conversation)
+    if ai_response is None:
+        await message.channel.send("Ошибка при обращении к ИИ.")
+        return
 
-        ai_response = response.choices[0].message.content
+    await message.channel.send(ai_response)
 
-        # Сохраняем в историю (пользовательское сообщение и ответ бота)
-        update_history(channel_id, message.content, author_name, ai_response)
-
-        await message.channel.send(ai_response)
-
-    except Exception as e:
-        print(f"Ошибка при вызове Claude через AITUNNEL: {e}")
-        await message.channel.send("Зафакапилась...")
+    # TTS, если бот в голосовом канале
+    voice_client = message.guild.voice_client
+    if voice_client and voice_client.is_connected():
+        await enqueue_tts(message.guild.id, ai_response)
 
 async def generate_auto_message(channel_id):
     """Генерирует короткое сообщение от лица персонажа, когда никто не пишет"""
     try:
-        # Очень короткий системный промпт для автосообщений
-        
-
-        response = client.chat.completions.create(
-            model="anthropic/claude-sonnet-4.6",
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": "Напиши сообщение для пустого чата."}
-            ],
-            max_tokens=60,  # очень короткий ответ
-            temperature=1.2,
-        )
-        return response.choices[0].message.content.strip()
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "Напиши сообщение для пустого чата."}
+        ]
+        response_text = await call_claude_api(messages)
+        if response_text:
+            return response_text.strip()
+        else:
+            return "Молчание..."
     except Exception as e:
-        import random
-        return random.choice("И тут факап...")
+        print(f"Ошибка автосообщения: {e}")
+        return "Что-то пошло не так..."
 
 @bot.event
 async def on_ready():
@@ -252,6 +297,87 @@ async def auto_message_loop():
                 except Exception as e:
                     print(f"[AUTO] Ошибка отправки: {e}")
         await asyncio.sleep(CHECK_INTERVAL)
+
+async def process_tts_queue(guild_id: int):
+    """Постоянно обрабатывает очередь TTS для конкретного голосового канала"""
+    await bot.wait_until_ready()
+    queue = tts_queues.get(guild_id)
+    if not queue:
+        return
+
+    while not tts_stop_flags.get(guild_id, False):
+        # Получаем следующий текст из очереди (блокирующая операция)
+        text = await queue.get()
+        if text is None:  # сигнал остановки
+            break
+
+        voice_client = bot.get_guild(guild_id).voice_client
+        if not voice_client or not voice_client.is_connected():
+            # Если бот вышел из канала – очищаем очередь и выходим
+            break
+
+        # Если уже что-то играет – ждём (очередь уже работает, но на всякий случай)
+        while voice_client.is_playing():
+            await asyncio.sleep(0.5)
+
+        # Генерируем аудио через TTS
+        audio_data = await generate_tts_audio(text)
+        if audio_data is None:
+            continue  # ошибка TTS – пропускаем
+
+        # Воспроизводим аудио из байтового потока
+        audio_source = discord.FFmpegPCMAudio(io.BytesIO(audio_data), pipe=True)
+        # Создаём событие для ожидания окончания воспроизведения
+        play_finished = asyncio.Event()
+
+        def after_play(error):
+            if error:
+                print(f"Ошибка воспроизведения: {error}")
+            bot.loop.call_soon_threadsafe(play_finished.set)
+
+        voice_client.play(audio_source, after=after_play)
+        await play_finished.wait()  # ждём, пока трек не закончится
+
+        # Отмечаем задачу выполненной
+        queue.task_done()
+
+    # Уборка: удаляем очередь и задачу при выходе
+    if guild_id in tts_queues:
+        del tts_queues[guild_id]
+    if guild_id in tts_tasks:
+        del tts_tasks[guild_id]
+    if guild_id in tts_stop_flags:
+        del tts_stop_flags[guild_id]
+
+async def generate_tts_audio(text: str) -> bytes | None:
+    print(f"🔊 TTS: Получен запрос для текста: {text[:50]}...")
+    voice = os.getenv('TTS_VOICE', 'nova')
+    url = "https://api.aitunnel.ru/v1/audio/speech"
+    headers = {
+        "Authorization": f"Bearer {AITUNNEL_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "tts-1-hd",
+        "voice": voice,
+        "input": text
+    }
+    print(f"🚀 TTS: Отправляю запрос в AITUNNEL с голосом {voice}")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, json=payload) as resp:
+                if resp.status == 200:
+                    audio_data = await resp.read()
+                    print(f"✅ TTS: Успешно получен аудиофайл размером {len(audio_data)} байт")
+                    return audio_data
+                else:
+                    error_text = await resp.text()
+                    print(f"❌ TTS: Ошибка API! Статус: {resp.status}, Текст: {error_text}")
+                    return None
+    except Exception as e:
+        print(f"❌ TTS: Исключение при сетевом запросе: {type(e).__name__}: {e}")
+        return None
 
 if __name__ == "__main__":
     # Загружаем дополнительную конфигурацию
